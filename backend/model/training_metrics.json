@@ -1,0 +1,25 @@
+{
+  "models": [
+    {
+      "name": "Crop Recommendation (RandomForest)",
+      "dataset": "crop_recommendation.csv",
+      "samples": 2200,
+      "classes": 22,
+      "test_accuracy": 0.9955
+    },
+    {
+      "name": "Soil & Fertilizer Recommendation (RandomForest)",
+      "dataset": "fertilizer_prediction.csv",
+      "samples": 99,
+      "classes": 7,
+      "test_accuracy": 0.95
+    },
+    {
+      "name": "Plant Disease Detection (MobileNetV2 PlantVillage)",
+      "dataset": "PlantVillage (pretrained HuggingFace)",
+      "samples": 54305,
+      "classes": 38,
+      "test_accuracy": null
+    }
+  ]
+}

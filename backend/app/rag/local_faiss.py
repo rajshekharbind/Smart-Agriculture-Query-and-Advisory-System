@@ -5,17 +5,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-from backend.app.config import DOCUMENTS_DIR, FAISS_DIR, DATA_DIR
+from backend.app.config import DATA_DIR, DOCUMENTS_DIR, FAISS_DIR, LOW_MEMORY_MODE
 from backend.app.llm import generate_text
 
 logger = logging.getLogger(__name__)
 
 META_FILE = DATA_DIR / "local_faiss_docs.json"
+TFIDF_CHUNKS_FILE = DATA_DIR / "local_tfidf_chunks.json"
 _embeddings = None
 _vector_store = None
 
@@ -23,6 +24,8 @@ _vector_store = None
 def _get_embeddings():
     global _embeddings
     if _embeddings is None:
+        from langchain_huggingface import HuggingFaceEmbeddings
+
         model_name = os.getenv("HUGGINGFACE_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
         logger.info("Initializing local FAISS embeddings: %s", model_name)
         _embeddings = HuggingFaceEmbeddings(
@@ -45,13 +48,29 @@ def _save_meta(meta: Dict[str, Any]):
         json.dump(meta, f, indent=2)
 
 
+def _load_tfidf_chunks() -> List[Dict[str, Any]]:
+    if TFIDF_CHUNKS_FILE.exists():
+        with open(TFIDF_CHUNKS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def _save_tfidf_chunks(chunks: List[Dict[str, Any]]):
+    with open(TFIDF_CHUNKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, indent=2)
+
+
 def _get_vector_store():
     global _vector_store
+    if LOW_MEMORY_MODE:
+        return None
     if _vector_store is not None:
         return _vector_store
     index_file = FAISS_DIR / "index.faiss"
     if index_file.exists():
         try:
+            from langchain_community.vectorstores import FAISS
+
             _vector_store = FAISS.load_local(
                 str(FAISS_DIR),
                 _get_embeddings(),
@@ -93,17 +112,24 @@ def ingest_document(file_path: Path) -> Dict[str, Any]:
         separators=["\n\n", "\n", " ", ""],
     )
     chunks = splitter.split_text(text)
-    metadatas = [{"source": file_path.name, "chunk": i} for i in range(len(chunks))]
 
-    embeddings = _get_embeddings()
-    vs = _get_vector_store()
-    if vs is None:
-        vs = FAISS.from_texts(chunks, embeddings, metadatas=metadatas)
+    if LOW_MEMORY_MODE:
+        existing = [c for c in _load_tfidf_chunks() if c.get("source") != file_path.name]
+        for i, ch in enumerate(chunks):
+            existing.append({"source": file_path.name, "chunk": i, "content": ch})
+        _save_tfidf_chunks(existing)
     else:
-        vs.add_texts(chunks, metadatas=metadatas)
+        from langchain_community.vectorstores import FAISS
 
-    vs.save_local(str(FAISS_DIR))
-    _vector_store = vs
+        metadatas = [{"source": file_path.name, "chunk": i} for i in range(len(chunks))]
+        embeddings = _get_embeddings()
+        vs = _get_vector_store()
+        if vs is None:
+            vs = FAISS.from_texts(chunks, embeddings, metadatas=metadatas)
+        else:
+            vs.add_texts(chunks, metadatas=metadatas)
+        vs.save_local(str(FAISS_DIR))
+        _vector_store = vs
 
     meta = _load_meta()
     meta[file_path.name] = {
@@ -138,6 +164,26 @@ def list_indexed_documents() -> Dict[str, Any]:
 
 
 def search_local_documents(query: str, k: int = 5) -> List[Dict[str, Any]]:
+    if LOW_MEMORY_MODE:
+        rows = _load_tfidf_chunks()
+        if not rows:
+            return []
+        corpus = [r["content"] for r in rows]
+        vec = TfidfVectorizer(stop_words="english")
+        mat = vec.fit_transform(corpus + [query])
+        sims = cosine_similarity(mat[-1], mat[:-1])[0]
+        top_idx = sims.argsort()[::-1][:k]
+        return [
+            {
+                "source": rows[i]["source"],
+                "chunk": rows[i]["chunk"],
+                "score": round(float(sims[i]), 4),
+                "content": rows[i]["content"],
+            }
+            for i in top_idx
+            if sims[i] > 0.01
+        ]
+
     vs = _get_vector_store()
     if vs is None:
         return []
@@ -178,18 +224,22 @@ def summarize_local_document(filename: str, language: str = "Hindi") -> Dict[str
 
 
 def ask_local_documents(question: str, language: str = "Hindi") -> Dict[str, Any]:
-    vs = _get_vector_store()
-    if vs is None:
-        # Auto-index existing documents on first ask if any exist
+    if not LOW_MEMORY_MODE and _get_vector_store() is None:
         for p in DOCUMENTS_DIR.iterdir():
             if p.is_file() and p.suffix.lower() in {".txt", ".md", ".pdf"}:
                 try:
                     ingest_document(p)
                 except Exception as e:
                     logger.warning("Auto-index skipped %s: %s", p.name, e)
-        vs = _get_vector_store()
+    elif LOW_MEMORY_MODE and not _load_tfidf_chunks():
+        for p in DOCUMENTS_DIR.iterdir():
+            if p.is_file() and p.suffix.lower() in {".txt", ".md"}:
+                try:
+                    ingest_document(p)
+                except Exception as e:
+                    logger.warning("Auto-index skipped %s: %s", p.name, e)
 
-    matches = search_local_documents(question, k=4) if vs is not None else []
+    matches = search_local_documents(question, k=4)
     context = "\n\n".join(f"[{m['source']}] {m['content']}" for m in matches)
 
     if context:
@@ -218,7 +268,6 @@ def ask_local_documents(question: str, language: str = "Hindi") -> Dict[str, Any
 
 
 def _pdf_escape(text: str) -> str:
-    # Convert non-ASCII safely to ASCII/Latin-1 for built-in Helvetica Type1 PDF
     safe = text.encode("latin-1", errors="replace").decode("latin-1")
     return safe.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
@@ -233,7 +282,6 @@ def generate_pdf_report(title: str, sections: List[Dict[str, str]]) -> bytes:
             lines.append(heading)
             lines.append("-" * min(55, len(heading)))
         for raw_line in body.splitlines():
-            # Word wrap to 84 chars
             words = raw_line.split()
             if not words:
                 lines.append("")
@@ -249,12 +297,10 @@ def generate_pdf_report(title: str, sections: List[Dict[str, str]]) -> bytes:
                 lines.append(current)
         lines.append("")
 
-    # Paginate (~46 lines per A4 page)
     page_size = 46
     pages = [lines[i : i + page_size] for i in range(0, len(lines), page_size)] or [["AgroSathi AI Report"]]
 
     objects: List[bytes] = []
-    # Obj 1: Catalog, Obj 2: Pages, Obj 3: Font
     page_obj_ids = []
     next_id = 4
     content_objs = []

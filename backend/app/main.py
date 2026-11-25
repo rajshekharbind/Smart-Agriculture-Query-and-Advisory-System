@@ -14,18 +14,14 @@ import speech_recognition as sr
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_pinecone import PineconeVectorStore
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from pinecone import Pinecone
 from pydantic import BaseModel
 
-from backend.app.config import DB_PATH, DOCUMENTS_DIR
+from backend.app.config import DB_PATH, DOCUMENTS_DIR, LOW_MEMORY_MODE
 from backend.app.database import init_db
 from backend.app.llm import generate_text, get_llm
-from backend.app.models.prediction import PredictionPipeline
 from backend.app.rag.local_faiss import list_indexed_documents, search_local_documents
 from backend.app.routers import agri_info, ai_tools, auth, documents_voice, farm_ops
 from backend.app.security import rate_limit, validate_image_upload
@@ -36,14 +32,30 @@ logger = logging.getLogger(__name__)
 # Initialize SQLite tables
 init_db()
 
-# -------------------- Optional Pinecone RAG Setup --------------------
+# -------------------- Lazy Pinecone RAG Setup --------------------
 pc = None
 index_name = os.getenv("PINECONE_INDEX_NAME", "smartagri-kb")
 retriever = None
+_pinecone_checked = False
 
-pinecone_api_key = os.getenv("PINECONE_API_KEY")
-if pinecone_api_key:
+
+def _get_retriever():
+    global pc, retriever, _pinecone_checked
+    if _pinecone_checked:
+        return retriever
+    _pinecone_checked = True
+
+    pinecone_api_key = os.getenv("PINECONE_API_KEY")
+    if not pinecone_api_key or LOW_MEMORY_MODE:
+        if LOW_MEMORY_MODE and pinecone_api_key:
+            logger.info("Low-memory mode active: skipping local PyTorch embeddings at startup; using TF-IDF/Gemini RAG.")
+        return None
+
     try:
+        from langchain_huggingface import HuggingFaceEmbeddings
+        from langchain_pinecone import PineconeVectorStore
+        from pinecone import Pinecone
+
         pc = Pinecone(api_key=pinecone_api_key)
         model_name = os.getenv("HUGGINGFACE_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
         embeddings = HuggingFaceEmbeddings(
@@ -51,7 +63,6 @@ if pinecone_api_key:
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True},
         )
-        embedding_dimension = len(embeddings.embed_query("test"))
         if index_name in pc.list_indexes().names():
             index = pc.Index(index_name)
             vector_store = PineconeVectorStore(
@@ -62,10 +73,12 @@ if pinecone_api_key:
             )
             retriever = vector_store.as_retriever(search_kwargs={"k": 3})
         else:
-            logger.warning("Pinecone index '%s' not found; using local FAISS RAG.", index_name)
+            logger.warning("Pinecone index '%s' not found; using local RAG.", index_name)
     except Exception as e:
-        logger.error("Could not initialize Pinecone: %s. Using local FAISS RAG.", e)
+        logger.error("Could not initialize Pinecone: %s. Using local RAG.", e)
         retriever = None
+    return retriever
+
 
 # Initialize primary LLM (Gemini / Groq fallback)
 llm = get_llm()
@@ -77,10 +90,11 @@ class ChatState(TypedDict):
 
 
 def retrieve_context(query: str) -> str:
-    """Retrieve context from Pinecone if configured, otherwise from local FAISS index."""
-    if retriever is not None:
+    """Retrieve context from Pinecone if configured (outside low-memory mode), otherwise local RAG."""
+    active_retriever = _get_retriever()
+    if active_retriever is not None:
         try:
-            docs = retriever.invoke(query)
+            docs = active_retriever.invoke(query)
             return "\n\n".join([doc.page_content for doc in docs])
         except Exception as e:
             logger.error("Pinecone retrieval error: %s", e)
@@ -90,7 +104,7 @@ def retrieve_context(query: str) -> str:
         if local_matches:
             return "\n\n".join(f"[{m['source']}] {m['content']}" for m in local_matches)
     except Exception as e:
-        logger.warning("Local FAISS retrieval skipped: %s", e)
+        logger.warning("Local RAG retrieval skipped: %s", e)
     return ""
 
 
@@ -241,11 +255,13 @@ def convert_messages(messages: List[Message]) -> List[BaseMessage]:
 @app.get("/health")
 def health_check():
     faiss_info = list_indexed_documents()
+    pinecone_configured = bool(os.getenv("PINECONE_API_KEY"))
     return {
         "status": "ok",
         "service": "AgroSathi AI — Smart Agricultural Assistance API",
         "llm_configured": get_llm() is not None,
-        "rag_enabled": retriever is not None or faiss_info["total_chunks"] > 0,
+        "rag_enabled": pinecone_configured or faiss_info["total_chunks"] > 0,
+        "low_memory_mode": LOW_MEMORY_MODE,
         "local_faiss_chunks": faiss_info["total_chunks"],
     }
 
@@ -407,6 +423,8 @@ async def predict_disease(
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
             temp_file.write(content)
             temp_path = temp_file.name
+
+        from backend.app.models.prediction import PredictionPipeline
 
         pipeline = PredictionPipeline(temp_path)
         result = pipeline.predict()

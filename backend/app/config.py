@@ -36,6 +36,13 @@ JWT_SECRET = os.getenv("JWT_SECRET", "agrosathi-dev-secret-change-in-production"
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "72"))
 
+# Auto-enable lightweight mode on Render (512MB RAM tier) unless explicitly disabled
+LOW_MEMORY_MODE = os.getenv("LOW_MEMORY_MODE", os.getenv("RENDER", "")).lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{APP_DB_PATH}")
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB

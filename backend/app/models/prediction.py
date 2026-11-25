@@ -1,9 +1,11 @@
 import json
 import logging
+import re
 import numpy as np
 from PIL import Image
 
-from backend.app.config import MODEL_DIR, ROOT_DIR
+from backend.app.config import LOW_MEMORY_MODE, MODEL_DIR, ROOT_DIR
+from backend.app.llm import GeminiChatWrapper, get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +27,44 @@ def _get_hf_model():
     return _hf_processor, _hf_model
 
 
+def _predict_with_gemini_vision(filename: str):
+    """Low-memory cloud Vision fallback for Render 512MB tier."""
+    llm = get_llm()
+    if not isinstance(llm, GeminiChatWrapper):
+        raise FileNotFoundError(
+            "Low-memory mode requires GEMINI_API_KEY or custom model8.keras for image disease analysis."
+        )
+
+    with open(filename, "rb") as f:
+        img_bytes = f.read()
+
+    ext = filename.rsplit(".", 1)[-1].lower()
+    mime = f"image/{'jpeg' if ext in {'jpg', 'jpeg'} else ext}"
+    prompt = (
+        "Inspect this crop/leaf image. Return ONLY valid JSON (no markdown fences) with keys: "
+        '"prediction" (short condition name like "Healthy Leaf" or "Possible Leaf Blight") and '
+        '"top_predictions" (array of 3 objects with "label" string and "probability" float between 0 and 1 summing <= 1).'
+    )
+    raw = llm.analyze_image(img_bytes, mime, prompt).strip()
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    parsed = json.loads(match.group(0)) if match else {}
+    top_preds = parsed.get("top_predictions") or [
+        {"label": parsed.get("prediction", "Visual Leaf Inspection Needed"), "probability": 0.72}
+    ]
+    return [{
+        "image": parsed.get("prediction") or top_preds[0]["label"],
+        "probabilities": [float(x["probability"]) for x in top_preds],
+        "top_predictions": [
+            {"label": str(x["label"]), "probability": float(x["probability"])}
+            for x in top_preds
+        ],
+        "model_source": f"gemini-vision:{llm.model}",
+    }]
+
+
 class PredictionPipeline:
     """Runs crop disease prediction using custom Keras model if available,
-    otherwise falls back to a pretrained PyTorch/Transformers plant-disease model.
+    Gemini Vision in low-memory cloud mode, or local PyTorch PlantVillage MobileNetV2.
     """
 
     def __init__(self, filename: str):
@@ -94,6 +131,9 @@ class PredictionPipeline:
                 "top_predictions": top_predictions,
                 "model_source": "custom:model8.keras",
             }]
+
+        if LOW_MEMORY_MODE:
+            return _predict_with_gemini_vision(self.filename)
 
         import torch
 

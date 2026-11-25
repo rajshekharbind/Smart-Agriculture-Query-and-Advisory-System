@@ -2,6 +2,13 @@
 
 A full-stack, mobile-first AI agricultural assistance platform designed for Indian farmers — supporting **Easy Mode** (simple Hindi-first navigation, voice input, audio playback) and **Expert Mode** (ML analytics, soil reports, PDF exports), with **Dark & Light Themes**.
 
+## Live Deployment & URLs
+
+- **Live Frontend (Vercel):** https://smart-agriculture-query-and-advisor.vercel.app/
+- **Backend API (Render):** Configured via [render.yaml](render.yaml) (e.g., `https://agrosathi-backend.onrender.com`, Swagger Docs at `/docs`, Health Check at `/health`)
+- **Local Frontend:** `http://localhost:5173`
+- **Local Backend API:** `http://localhost:8000` (`http://localhost:8000/docs`)
+
 Home-Page
 <img width="1903" height="975" alt="image" src="https://github.com/user-attachments/assets/f050b248-0a01-42c8-834e-bf1a3d2b9acb" />
 <img width="1897" height="967" alt="image" src="https://github.com/user-attachments/assets/d0f331aa-3f2a-41c2-b72e-6310371cdf6a" />
@@ -23,6 +30,33 @@ Home-Page
 <img width="1882" height="927" alt="image" src="https://github.com/user-attachments/assets/3ff6d562-a62f-4236-bee8-5112f725fe51" />
 <img width="1897" height="976" alt="image" src="https://github.com/user-attachments/assets/313a8269-ac75-49ca-90f2-d88880022604" />
 
+
+## Technology Stack
+
+### Frontend
+- **Framework:** React 19 + Vite 7
+- **Styling & UI:** Tailwind CSS 3 (Dark & Light Themes, Glassmorphism, Mobile-First Drawer & Easy/Expert Modes)
+- **Icons & HTTP:** `lucide-react`, `react-icons`, Axios
+- **Browser APIs:** Web Audio API (16-bit PCM WAV voice recording), MediaDevices `getUserMedia` (live camera capture)
+
+### Backend & Security
+- **API Framework:** FastAPI + Uvicorn (modular routers for Auth, AI Tools, Agri Info, Farm Ops, PDF/Voice)
+- **Orchestration & Workflows:** LangGraph (`StateGraph` + `SqliteSaver` persistent chat checkpoints), LangChain
+- **Database:** SQLite (`agrosathi.db`, `chatbot.db`) locally; PostgreSQL-ready (`psycopg2-binary`, `docker-compose.yml`)
+- **Security:** JWT authentication (`PyJWT`), `bcrypt` password hashing, per-IP sliding-window rate limiting, file extension/size & OpenCV image validation
+
+### AI, ML Models & Data Stack
+
+| Capability | Model / Engine | Dataset / Source | Details |
+| :--- | :--- | :--- | :--- |
+| **AI Chat & Advisory** | Google **Gemini 2.5 Flash** (`google-genai`) + optional **Groq** fallback | Live prompt + RAG context | Multi-language responses (Hindi, English, Malayalam, Marathi, Tamil, Telugu, etc.) |
+| **Crop Recommendation** | `RandomForestClassifier` (`scikit-learn` / `crop_recommender.joblib`) | `crop_recommendation.csv` (2,200 rows, 22 crops) | **99.55% test accuracy** on N, P, K, temperature, humidity, pH, rainfall |
+| **Soil & Fertilizer Analysis** | `RandomForestClassifier` + `OneHotEncoder` (`fertilizer_recommender.joblib`) | `fertilizer_prediction.csv` (99 rows, 7 fertilizers) + `crop_npk_reference.csv` | **95.00% test accuracy** + NPK/pH deficiency diagnostics |
+| **Crop Disease Detection** | **MobileNetV2** (`linkanjarad/mobilenet_v2_1.0_224-plant-disease-identification`, 38 classes) + custom `model8.keras` support + **Gemini 2.5 Flash Vision** (`LOW_MEMORY_MODE`) | PlantVillage (54,305 images, 38 classes) | OpenCV quality check (`blur_score`, `brightness`) + non-diagnostic disclaimer |
+| **Pest & Soil Vision** | **Gemini 2.5 Flash Vision** + OpenCV (`cv2`) | Uploaded / camera-captured images | Organic-first IPM advice & visual soil color/texture cues |
+| **PDF & Knowledge RAG** | **FAISS** + `sentence-transformers/all-MiniLM-L6-v2` (local) / **Pinecone** (`smartagri-kb`, 384-dim) / **TF-IDF** (`LOW_MEMORY_MODE`) | Uploaded PDFs, DOCX, TXT, MD + `documents/` | Text extraction (`pypdf`, `docx2txt`), Hindi summaries, grounded Q&A, pure-Python `.pdf` report generator |
+| **Voice Input & Output** | `SpeechRecognition` (Google STT) + `gTTS` (Text-to-Speech) | Browser 16-bit PCM WAV audio | Speak & listen in Hindi, Malayalam, English, and regional Indian languages |
+| **Live Weather** | Open-Meteo Geocoding & Forecast API | Live real-time meteorological data | 5-day forecast + automated rain/heat/humidity/wind farming alerts |
 
 ## Core Modules
 
@@ -95,7 +129,22 @@ npm run dev
 ```
 Open **http://localhost:5173** (API Swagger Docs at **http://localhost:8000/docs**).
 
-## Docker Deployment
+## Deployment (Render + Vercel & Docker)
+
+### Backend on Render
+- Blueprint: [render.yaml](render.yaml) | Dependencies: [requirements-render.txt](requirements-render.txt) | Python: `3.10.14` ([.python-version](.python-version), [runtime.txt](runtime.txt))
+- **Root Directory:** *(leave blank)*
+- **Build Command:** `pip install --no-cache-dir -r requirements-render.txt && python backend/scripts/train_models.py`
+- **Start Command:** `python -m uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT --workers 1`
+- **Health Check:** `/health`
+- **Env Vars:** `PYTHON_VERSION=3.10.14`, `LOW_MEMORY_MODE=1`, `USE_TF=0`, `USE_TORCH=1`, `GEMINI_API_KEY`, `PINECONE_API_KEY`, `PINECONE_INDEX_NAME=smartagri-kb`, `JWT_SECRET`, `ALLOWED_ORIGINS=https://smart-agriculture-query-and-advisor.vercel.app`
+
+### Frontend on Vercel
+- **Root Directory:** `frontend` (includes [frontend/vercel.json](frontend/vercel.json))
+- **Build Command:** `npm run build` | **Output Directory:** `dist`
+- **Env Var:** `VITE_API_URL=https://<your-render-backend>.onrender.com`
+
+### Docker Deployment
 ```bash
 docker compose up --build
 ```
